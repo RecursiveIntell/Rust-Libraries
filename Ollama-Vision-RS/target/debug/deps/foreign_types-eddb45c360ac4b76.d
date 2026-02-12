@@ -1,0 +1,7 @@
+/home/sikmindz/Coding/Libraries/Ollama-Vision-RS/target/debug/deps/foreign_types-eddb45c360ac4b76.d: /home/sikmindz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
+
+/home/sikmindz/Coding/Libraries/Ollama-Vision-RS/target/debug/deps/libforeign_types-eddb45c360ac4b76.rlib: /home/sikmindz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
+
+/home/sikmindz/Coding/Libraries/Ollama-Vision-RS/target/debug/deps/libforeign_types-eddb45c360ac4b76.rmeta: /home/sikmindz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
+
+/home/sikmindz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs:
