@@ -1,6 +1,6 @@
-# Rust-Libraries
+# Libraries
 
-A collection of libraries for building AI-powered Tauri desktop applications. Includes Rust crates for batch processing, LLM pipelines, image vision, job queues, and a ComfyUI client, plus a React hooks library for the Tauri frontend.
+A collection of libraries for building AI-powered desktop applications. Includes Rust crates for graph-based agent orchestration, LLM node payloads, batch processing, image vision, job queues, a ComfyUI client, and a React hooks library for Tauri frontends.
 
 ---
 
@@ -8,12 +8,113 @@ A collection of libraries for building AI-powered Tauri desktop applications. In
 
 | Library | Language | Description |
 |---------|----------|-------------|
+| [agent-graph](#agent-graph) | Rust | Graph-based agent orchestration — LangGraph for Rust |
 | [AI-Batch-Queue](#ai-batch-queue) | Rust | Model-aware batch processing with ETA estimation for Tauri 2 |
 | [ComfyUI-RS](#comfyui-rs) | Rust | Async client for ComfyUI image generation with WebSocket progress |
-| [LLM-Pipeline](#llm-pipeline) | Rust | Multi-stage LLM workflow orchestrator for Ollama |
+| [job-queue](#job-queue) | Rust | Framework-agnostic background job queue with SQLite persistence |
+| [LLM-Pipeline](#llm-pipeline) | Rust | Reusable node payloads for LLM workflows (Ollama) |
 | [Ollama-Vision-RS](#ollama-vision-rs) | Rust | Structured image tagging and captioning via Ollama vision models |
-| [Tauri-Queue](#tauri-queue) | Rust | Priority-based persistent job queue for Tauri 2 |
+| [Tauri-Queue](#tauri-queue) | Rust | Tauri 2 integration layer for job-queue |
 | [Tauri-React-Hooks](#tauri-react-hooks) | TypeScript | React hooks for Tauri events, commands, and streaming |
+
+---
+
+## agent-graph
+
+A graph-based agent orchestrator for Rust — **LangGraph for the Rust ecosystem**. Owns control-flow (routing, loops, joins, parallelism, interrupts/resume, checkpointing) and executes node work via a pluggable Payload layer.
+
+### Features
+
+- **PayloadNode** — Execute `Box<dyn Payload>` work units (LLM calls, API requests, etc.)
+- **Conditional Routing** — Dynamic routing based on state via router functions
+- **Fan-out / Fan-in** — Parallel branches with deterministic join semantics via `JoinNode`
+- **Loops & Cycles** — Bounded iteration with max-steps and explicit termination
+- **Interrupt / Resume** — Pause execution for human input, resume from checkpoint
+- **Cancellation** — Cancel running graphs via atomic flag
+- **EventSink** — Structured event pipeline (`RunStart`, `NodeEnd`, `Token`, etc.)
+- **CheckpointStore** — Granular per-attempt recording (in-memory and SQLite backends)
+- **Executor** — Pluggable node execution strategy (in-process default)
+
+### Core API
+
+```rust
+use agent_graph::prelude::*;
+
+let graph = AgentGraph::builder()
+    .add_node("step1", node!(|state| async move {
+        state.set("count", 1).await?;
+        Ok(())
+    }))
+    .add_node("step2", node!(|state| async move {
+        let count: i32 = state.get("count").await?;
+        state.set("count", count + 1).await?;
+        Ok(())
+    }))
+    .add_edge("step1", "step2")
+    .build()?;
+
+let state = AgentState::new();
+let result = graph.execute("step1", state).await?;
+```
+
+### PayloadNode (LLM Integration)
+
+```rust
+struct MyLlmPayload;
+
+impl Payload for MyLlmPayload {
+    fn invoke(
+        &self, input: Value, ctx: &PayloadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<PayloadOutput, PayloadError>> + Send + '_>> {
+        Box::pin(async move {
+            Ok(PayloadOutput {
+                value: json!({"response": "Hello from LLM!"}),
+                meta: HashMap::new(),
+            })
+        })
+    }
+}
+
+let graph = AgentGraph::builder()
+    .add_node("llm", Box::new(
+        PayloadNode::new(Box::new(MyLlmPayload))
+            .with_input_selector(|state| state.get("query").cloned().unwrap_or(Value::Null))
+    ))
+    .build()?;
+```
+
+### Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| `AgentGraph` | The orchestrator. Owns nodes, edges, and execution semantics |
+| `PayloadNode` | Wraps `Box<dyn Payload>` for external work (LLM calls, etc.) |
+| `JoinNode` | Explicit fan-in merge node with configurable merge function |
+| `EventSink` | Trait for structured event handling (Noop, Channel, Callback) |
+| `CheckpointStore` | Granular per-attempt recording (InMemory default) |
+| `AgentState` | Shared mutable state (`HashMap<String, Value>` under `Arc<RwLock>`) |
+
+### Relationship to LLM-Pipeline
+
+| | LLM-Pipeline | agent-graph |
+|---|---|---|
+| **Role** | Payload layer (LangChain) | Orchestrator (LangGraph) |
+| **Owns** | LLM calls, parsing, streaming | Routing, loops, joins, checkpoints |
+| **Boundary** | `Payload` trait (Value in/out) | `PayloadNode` executes payloads |
+
+### Examples
+
+```bash
+cargo run --example basic             # Simple linear graph
+cargo run --example conditional       # Conditional routing
+cargo run --example loop_example      # Quality refinement loop
+cargo run --example parallel          # Parallel fan-out execution
+cargo run --example streaming         # Real-time event streaming
+cargo run --example human_in_loop     # Interrupt/resume
+cargo run --example checkpointing     # Save/resume execution
+cargo run --example map_reduce        # Map-reduce pattern
+cargo run --example subgraph          # Nested graphs
+```
 
 ---
 
@@ -158,86 +259,113 @@ client.interrupt().await?;
 
 ## LLM-Pipeline
 
-A multi-stage LLM workflow orchestrator for Ollama that chains multiple language model calls into composable pipelines with streaming, extended thinking, and context injection.
+Reusable node payloads for LLM workflows, with optional sequential chaining. Provides the building blocks for LLM-powered workflows: **payloads** that execute LLM calls, **parsing utilities** for messy model output, and a **chain** helper for sequential composition.
+
+Orchestration (routing, loops, concurrency, checkpoints) belongs in your graph runtime (e.g. agent-graph). This crate provides what runs _inside_ each node.
 
 ### Features
 
-- **Composable Stages** — Chain multiple LLM calls with automatic output-to-input piping.
-- **Per-Stage Models** — Use different Ollama models for different stages in the same pipeline.
-- **Extended Thinking** — Support for DeepSeek R1 style `<think>...</think>` reasoning blocks.
-- **Streaming** — Real-time token callbacks during execution with per-token control.
-- **Cancellation** — Interrupt pipelines mid-execution via shared `Arc<AtomicBool>`.
-- **Context Injection** — Inject domain knowledge into prompt templates via `{key}` placeholders.
-- **Stage Bypass** — Dynamically enable/disable stages during pipeline configuration.
-- **Chat Mode** — Stages with system prompts automatically route to Ollama's `/api/chat` endpoint.
-- **Defensive JSON Parsing** — Extracts JSON from raw responses, markdown code blocks, embedded JSON, and partial JSON with bracket matching.
+- **Payload Trait** — Object-safe `Payload` trait with `serde_json::Value` wire type for heterogeneous workflows
+- **LlmCall** — First-class Ollama payload with generate, chat, and streaming modes
+- **Chain** — Sequential payload composition (chains are also payloads, so they nest)
+- **Typed Extraction** — `PayloadOutput::parse_as::<T>()` at workflow edges
+- **Event Hooks** — Optional `EventHandler` for streaming tokens and lifecycle signals
+- **Streaming Decoder** — Buffered NDJSON framing that handles chunk-boundary splits
+- **Defensive Parsing** — Extracts JSON from markdown blocks, embedded JSON, and raw LLM output
+- **Extended Thinking** — Support for DeepSeek R1 style `<think>` reasoning blocks
+- **Cancellation** — `AtomicBool`-based cooperative cancellation
+- **Pipeline Compat** — Original `Pipeline<T>` API still works, now backed by payloads internally
 
-### Core API
+### Core API (Payload)
 
 ```rust
-// Define output type
-#[derive(Serialize, Deserialize, Clone)]
-struct Analysis {
-    summary: String,
-    key_points: Vec<String>,
-}
+use llm_pipeline::{LlmCall, Chain, ExecCtx, LlmConfig};
+use llm_pipeline::payload::Payload;
+use serde::Deserialize;
+use serde_json::json;
 
-// Build a multi-stage pipeline
-let pipeline = Pipeline::<Analysis>::builder()
-    .add_stage(
-        Stage::new("analyze")
-            .with_model("llama3.2:3b")
-            .with_system_prompt("You are an expert analyst.")
-            .with_temperature(0.3)
-            .with_json_mode(true)
-    )
-    .add_stage(
-        Stage::new("refine")
-            .with_model("deepseek-r1:8b")
-            .with_thinking(true)
-    )
-    .with_context({
-        let mut ctx = PipelineContext::new();
-        ctx.insert("user_name", "Alice");
-        ctx.insert("expertise_level", "beginner");
-        ctx
-    })
-    .with_cancellation(cancel_flag)
+#[derive(Debug, Deserialize)]
+struct Analysis { summary: String }
+
+let ctx = ExecCtx::builder("http://localhost:11434")
+    .var("domain", "science")
     .build();
 
-// Execute
-let result = pipeline.execute(PipelineInput::new("Analyze this text...")).await?;
-println!("{}", result.final_output.summary);
+let chain = Chain::new("analyze")
+    .push(Box::new(
+        LlmCall::new("draft", "Analyze {input} in {domain}")
+            .with_config(LlmConfig::default().with_json_mode(true))
+    ))
+    .push(Box::new(
+        LlmCall::new("refine", "Refine: {input}")
+            .with_config(LlmConfig::default().with_json_mode(true))
+    ));
 
-// Or execute with streaming
-let result = pipeline.execute_streaming(input, |token| {
-    print!("{}", token);
-}).await?;
-
-// Access thinking from stages
-if let Some(thinking) = &result.stage_results[0].thinking {
-    println!("Reasoning: {}", thinking);
-}
+let output = chain.execute(&ctx, json!("Your text here")).await?;
+let result: Analysis = output.parse_as()?;
 ```
 
-### Stage Configuration
+### Event Handler
 
-| Option | Method | Description |
-|--------|--------|-------------|
-| Model | `with_model()` | Ollama model for this stage |
-| System prompt | `with_system_prompt()` | Enables chat mode |
-| Temperature | `with_temperature()` | 0.0 = deterministic, 1.0 = creative |
-| Max tokens | `with_max_tokens()` | Limit generation length |
-| JSON mode | `with_json_mode()` | Force JSON formatted output |
-| Thinking | `with_thinking()` | Enable extended reasoning |
-| Enabled | `disabled()` | Skip this stage during execution |
+```rust
+use llm_pipeline::events::{Event, FnEventHandler};
+
+let ctx = ExecCtx::builder("http://localhost:11434")
+    .event_handler(Arc::new(FnEventHandler(|event: Event| {
+        match event {
+            Event::Token { chunk, .. } => print!("{}", chunk),
+            Event::PayloadStart { name, .. } => eprintln!("[start] {}", name),
+            Event::PayloadEnd { name, ok } => eprintln!("[end] {} ok={}", name, ok),
+        }
+    })))
+    .build();
+```
+
+### Parsing Utilities
+
+```rust
+use llm_pipeline::parsing;
+
+// Extract <think>...</think> blocks
+let (thinking, cleaned) = parsing::extract_thinking("<think>reasoning</think>answer");
+
+// Defensive JSON extraction
+let value = parsing::parse_value_lossy("Here is JSON: {\"key\": 1}");
+
+// Typed parsing from messy text
+let result: MyStruct = parsing::parse_as("```json\n{\"x\": 1}\n```")?;
+```
+
+### Pipeline API (Compatibility)
+
+The original `Pipeline<T>` + `Stage` API continues to work unchanged:
+
+```rust
+let pipeline = Pipeline::<Analysis>::builder()
+    .add_stage(Stage::new("analyze", "Analyze: {input}").with_json_mode(true))
+    .add_stage(Stage::new("refine", "Refine: {input}").with_thinking(true))
+    .build()?;
+
+let result = pipeline.execute(&client, "http://localhost:11434", PipelineInput::new("...")).await?;
+```
+
+### Migration from Pipeline to Payloads
+
+| Pipeline API | Payload API |
+|---|---|
+| `Stage::new(name, template)` | `LlmCall::new(name, template)` |
+| `Pipeline::<T>::builder().add_stage(...)` | `Chain::new(name).push(Box::new(...))` |
+| `pipeline.execute(&client, endpoint, input)` | `chain.execute(&ctx, json!(input))` |
+| `result.final_output` (typed `T`) | `output.parse_as::<T>()?` |
+| `PipelineContext::new().insert(k, v)` | `ExecCtx::builder(url).var(k, v)` |
 
 ### Examples
 
-- **`basic_pipeline`** — Two-stage analysis pipeline with JSON mode.
-- **`streaming_pipeline`** — Real-time token streaming with progress callbacks.
-- **`thinking_mode`** — Extended thinking with DeepSeek R1, accessing reasoning blocks.
-- **`context_injection`** — Personalized output using context variable substitution.
+- **`payload_chain`** — Heterogeneous Value chain with typed parse and event hooks (new API)
+- **`basic_pipeline`** — Two-stage analysis pipeline with JSON mode (compat API)
+- **`streaming_pipeline`** — Real-time token streaming with progress callbacks (compat API)
+- **`thinking_mode`** — Extended thinking with DeepSeek R1 (compat API)
+- **`context_injection`** — Personalized output using context variable substitution (compat API)
 
 ---
 
@@ -322,9 +450,9 @@ let config = OllamaVisionConfig {
 
 ---
 
-## Tauri-Queue
+## job-queue
 
-A persistent, priority-based background job queue for Tauri 2 applications with SQLite storage, hardware throttling, and real-time frontend progress events.
+A production-grade, framework-agnostic background job queue with SQLite persistence. Extracted from Tauri-Queue so it can be used in any Rust application — CLI tools, servers, or desktop apps.
 
 ### Features
 
@@ -332,16 +460,35 @@ A persistent, priority-based background job queue for Tauri 2 applications with 
 - **SQLite Persistence** — Jobs survive app crashes and restarts.
 - **Hardware Throttling** — Configurable cooldown duration and max consecutive jobs before forced cooldown.
 - **Real-Time Cancellation** — Cancel pending or in-progress jobs via cooperative `is_cancelled()` checking.
-- **Progress Tracking** — Jobs emit real-time progress events to the frontend with current/total steps.
+- **Progress Tracking** — Pluggable `QueueEventEmitter` trait for progress reporting.
 - **Pause/Resume** — Pause the entire queue; the current job finishes but no new ones start.
 - **Crash Recovery** — Automatically requeues jobs that were interrupted by crashes.
 - **Job Pruning** — Delete old completed/failed/cancelled jobs after a specified number of days.
-- **Job Reordering** — Change priority of pending jobs before they execute.
+- **Framework-Agnostic** — No Tauri dependency. Built-in `NoopEventEmitter` and `LoggingEventEmitter`.
 
 ### Core API
 
 ```rust
-// Configure the queue
+use job_queue::*;
+
+// Define a job handler
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { total_steps: u32 }
+
+impl JobHandler for MyJob {
+    async fn execute(&self, ctx: &JobContext) -> Result<JobResult, QueueError> {
+        for i in 0..self.total_steps {
+            if ctx.is_cancelled() {
+                return Err(QueueError::Cancelled);
+            }
+            ctx.emit_progress(i, self.total_steps);
+            // ... do work ...
+        }
+        Ok(JobResult::success())
+    }
+}
+
+// Configure and run
 let config = QueueConfig::builder()
     .db_path("queue.db")
     .cooldown(Duration::from_secs(2))
@@ -350,34 +497,60 @@ let config = QueueConfig::builder()
     .build();
 
 let manager = QueueManager::new(config).await?;
-
-// Define a job handler
-#[async_trait]
-impl JobHandler for MyJob {
-    async fn execute(&self, ctx: &JobContext) -> Result<JobResult, QueueError> {
-        for i in 0..self.total_steps {
-            if ctx.is_cancelled() {
-                return Err(QueueError::Cancelled);
-            }
-            ctx.emit_progress(i, self.total_steps).await?;
-            // ... do work ...
-        }
-        Ok(JobResult::success())
-    }
-}
-
-// Add jobs with priority
 manager.add(my_job, QueuePriority::High).await?;
-manager.add(other_job, QueuePriority::Normal).await?;
+manager.spawn(Arc::new(NoopEventEmitter));
 
 // Control the queue
 manager.pause().await?;
 manager.resume().await?;
 manager.cancel(&job_id).await?;
+manager.prune(7).await?;
+```
 
-// Query and maintain
-let jobs = manager.list().await?;
-manager.prune(7).await?; // Delete jobs older than 7 days
+### Event Emitter Trait
+
+```rust
+pub trait QueueEventEmitter: Send + Sync + 'static {
+    fn emit_job_started(&self, event: JobStartedEvent);
+    fn emit_job_completed(&self, event: JobCompletedEvent);
+    fn emit_job_failed(&self, event: JobFailedEvent);
+    fn emit_job_progress(&self, event: JobProgressEvent);
+    fn emit_job_cancelled(&self, event: JobCancelledEvent);
+}
+```
+
+Built-in implementations: `NoopEventEmitter` (testing), `LoggingEventEmitter` (tracing-based logging).
+
+### Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `db_path` | `":memory:"` | SQLite database path |
+| `cooldown` | `0s` | Delay between job executions |
+| `max_consecutive` | `0` (unlimited) | Max jobs before forced cooldown |
+| `poll_interval` | `2s` | How often to poll for new jobs |
+
+---
+
+## Tauri-Queue
+
+A thin Tauri 2 integration layer for [job-queue](#job-queue). Provides a `TauriEventEmitter` that bridges job-queue lifecycle events to Tauri's frontend event system, plus re-exports all core job-queue types.
+
+### Core API
+
+```rust
+use tauri_queue::*;
+
+// All job-queue types are re-exported
+let config = QueueConfig::builder()
+    .db_path("queue.db")
+    .build();
+
+let manager = QueueManager::new(config).await?;
+manager.add(my_job, QueuePriority::High).await?;
+
+// Spawn with Tauri event emitter — bridges events to the frontend
+manager.spawn(TauriEventEmitter::arc(app_handle));
 ```
 
 ### Tauri Events
@@ -389,15 +562,6 @@ manager.prune(7).await?; // Delete jobs older than 7 days
 | `queue:job_completed` | `{ jobId, output? }` |
 | `queue:job_failed` | `{ jobId, error }` |
 | `queue:job_cancelled` | `{ jobId }` |
-
-### Configuration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `db_path` | `":memory:"` | SQLite database path |
-| `cooldown` | `0s` | Delay between job executions |
-| `max_consecutive` | `0` (unlimited) | Max jobs before forced cooldown |
-| `poll_interval` | `2s` | How often to poll for new jobs |
 
 ### Examples
 
